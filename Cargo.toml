@@ -1,0 +1,25 @@
+[package]
+name = "castalia-wallet-sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Local hybrid-key ceremony and protected seed primitives for Castalia wallets"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+argon2 = "0.5.3"
+base64 = "0.22.1"
+bip39 = "2.2.0"
+blake3 = "1.8.2"
+chacha20poly1305 = "0.10.1"
+ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
+fips204 = "0.4.6"
+getrandom = "0.3.4"
+rpassword = "7.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
