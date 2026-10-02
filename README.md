@@ -10,7 +10,7 @@ The ceremony generates one 32-byte secret from OS randomness and deterministical
 - a password-only local vault for routine restart/unlock;
 - a recovery kit requiring both an independent 24-word mnemonic and the password.
 
-The mnemonic encodes an independent recovery secret. It does not encode the Member Key secret directly. Artifacts are created with owner-only permissions on Unix and are never overwritten.
+The mnemonic encodes an independent recovery secret. It does not encode the Member Key secret directly. Artifacts are published without overwriting an existing destination and use exact owner-only `0600` permissions on supported Unix platforms. The parent directory must already exist and must not be group- or world-writable. Reads reject symlinks, hardlinks, nonregular files and artifacts larger than 64 KiB. Every path ancestor must remain trusted during the operation; the API does not pin the complete ancestor chain. Errors beginning with `destination was committed` mean publication succeeded but cleanup or directory synchronization failed: inspect the existing destination before retrying.
 
 This repository does not register Member Keys, create Dregg cells, register Dregg nodes, or make network requests.
 

@@ -6,9 +6,9 @@
 //! behavior lives in this crate.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::Path,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
 };
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -37,6 +37,7 @@ const KDF_OUTPUT_LEN: usize = 32;
 const ARGON2_MEMORY_KIB: u32 = 64 * 1024;
 const ARGON2_ITERATIONS: u32 = 3;
 const ARGON2_LANES: u32 = 1;
+const MAX_ARTIFACT_BYTES: u64 = 64 * 1024;
 
 /// Errors returned by wallet ceremony, signing, persistence, and recovery.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +60,19 @@ pub enum WalletError {
     InvalidArtifact(String),
     #[error("hybrid signature verification failed: {0}")]
     VerificationFailed(&'static str),
+    #[error(
+        "destination was committed and parent directory synced, but temporary artifact unlink failed: {0}"
+    )]
+    DestinationCommittedTempUnlink(#[source] std::io::Error),
+    #[error(
+        "destination was committed but temporary artifact unlink and parent directory fsync both failed; durability is uncertain (unlink: {unlink}; fsync: {parent_sync})"
+    )]
+    DestinationCommittedTempUnlinkAndParentSync {
+        unlink: std::io::Error,
+        parent_sync: std::io::Error,
+    },
+    #[error("destination was committed but parent directory fsync failed: {0}")]
+    DestinationCommittedParentSync(#[source] std::io::Error),
     #[error("I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON failed: {0}")]
@@ -238,10 +252,26 @@ impl LocalVault {
         signer_from_opened_secret(secret, self.protected.anchor_id)
     }
 
+    /// Persist the encrypted vault without replacing an existing destination.
+    ///
+    /// # Security precondition
+    ///
+    /// Every path ancestor through the destination's direct parent must be trusted
+    /// and non-replaceable by a less-trusted user for the duration of this call.
+    /// The implementation validates the direct parent but does not pin the full
+    /// ancestor chain with directory descriptors.
     pub fn write_private(&self, path: impl AsRef<Path>) -> Result<(), WalletError> {
         write_private_json(path.as_ref(), self)
     }
 
+    /// Read an encrypted vault from a trusted path hierarchy.
+    ///
+    /// # Security precondition
+    ///
+    /// Every path ancestor through the artifact's direct parent must be trusted
+    /// and non-replaceable by a less-trusted user for the duration of this call.
+    /// The implementation validates the direct parent but does not pin the full
+    /// ancestor chain with directory descriptors.
     pub fn read(path: impl AsRef<Path>) -> Result<Self, WalletError> {
         read_private_json(path.as_ref())
     }
@@ -286,10 +316,26 @@ impl RecoveryKit {
         Ok((signer, LocalVault { protected }))
     }
 
+    /// Persist the encrypted recovery kit without replacing an existing destination.
+    ///
+    /// # Security precondition
+    ///
+    /// Every path ancestor through the destination's direct parent must be trusted
+    /// and non-replaceable by a less-trusted user for the duration of this call.
+    /// The implementation validates the direct parent but does not pin the full
+    /// ancestor chain with directory descriptors.
     pub fn write_private(&self, path: impl AsRef<Path>) -> Result<(), WalletError> {
         write_private_json(path.as_ref(), self)
     }
 
+    /// Read an encrypted recovery kit from a trusted path hierarchy.
+    ///
+    /// # Security precondition
+    ///
+    /// Every path ancestor through the artifact's direct parent must be trusted
+    /// and non-replaceable by a less-trusted user for the duration of this call.
+    /// The implementation validates the direct parent but does not pin the full
+    /// ancestor chain with directory descriptors.
     pub fn read(path: impl AsRef<Path>) -> Result<Self, WalletError> {
         read_private_json(path.as_ref())
     }
@@ -514,28 +560,311 @@ fn envelope_aad(kind: &str, anchor_id: &[u8; 32]) -> Vec<u8> {
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), WalletError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = artifact_parent(path);
+    verify_trusted_parent(parent)?;
 
     let bytes = Zeroizing::new(serde_json::to_vec_pretty(value)?);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
+    let (mut file, mut temporary) = create_private_temporary(parent)?;
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    Ok(())
+    verify_temporary_entry(&file, temporary.path())?;
+
+    publish_without_overwrite(temporary.path(), path)?;
+    temporary.mark_published();
+    let unlink_error = fs::remove_file(temporary.path()).err();
+    let parent_sync_error = sync_parent_directory(parent).err();
+    match (unlink_error, parent_sync_error) {
+        (None, None) => Ok(()),
+        (None, Some(error)) => Err(WalletError::DestinationCommittedParentSync(error)),
+        (Some(error), None) => Err(WalletError::DestinationCommittedTempUnlink(error)),
+        (Some(unlink), Some(parent_sync)) => {
+            Err(WalletError::DestinationCommittedTempUnlinkAndParentSync {
+                unlink,
+                parent_sync,
+            })
+        }
+    }
 }
 
 fn read_private_json<T: DeserializeOwned>(path: &Path) -> Result<T, WalletError> {
-    let bytes = Zeroizing::new(fs::read(path)?);
+    verify_trusted_parent(artifact_parent(path))?;
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact must not be a symlink".into(),
+        ));
+    }
+    if !path_metadata.file_type().is_file() {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact must be a regular file".into(),
+        ));
+    }
+
+    let file = open_private_file_no_follow(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact must be a regular file".into(),
+        ));
+    }
+    verify_opened_file(&path_metadata, &metadata)?;
+    if metadata.len() > MAX_ARTIFACT_BYTES {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact is too large".into(),
+        ));
+    }
+
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(MAX_ARTIFACT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact is too large".into(),
+        ));
+    }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn artifact_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn verify_trusted_parent(parent: &Path) -> Result<(), WalletError> {
+    let metadata = fs::symlink_metadata(parent).map_err(|error| {
+        WalletError::InvalidArtifact(format!(
+            "secret artifact parent directory must already exist: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact parent must be a real non-symlink directory".into(),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.mode() & 0o022 != 0 {
+            return Err(WalletError::InvalidArtifact(
+                "secret artifact parent must not be group- or world-writable".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_private_temporary(parent: &Path) -> Result<(File, TemporaryArtifact), WalletError> {
+    for _ in 0..16 {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|error| WalletError::Randomness(error.to_string()))?;
+        let temporary_path = parent.join(format!("{:032x}", u128::from_ne_bytes(random)));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary_path) {
+            Ok(file) => {
+                let temporary = TemporaryArtifact::new(temporary_path);
+                set_and_verify_private_mode(&file)?;
+                return Ok((file, temporary));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(WalletError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary artifact",
+    )))
+}
+
+#[cfg(unix)]
+fn set_and_verify_private_mode(file: &File) -> Result<(), WalletError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    if metadata.mode() & 0o7777 != 0o600 {
+        return Err(WalletError::InvalidArtifact(
+            "temporary secret artifact does not have exact 0600 permissions".into(),
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(WalletError::InvalidArtifact(
+            "temporary secret artifact has an unexpected hardlink".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_and_verify_private_mode(_file: &File) -> Result<(), WalletError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private-artifact writes are unsupported on this platform",
+    )
+    .into())
+}
+
+#[cfg(unix)]
+fn verify_temporary_entry(file: &File, path: &Path) -> Result<(), WalletError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path_metadata = fs::symlink_metadata(path)?;
+    let opened_metadata = file.metadata()?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.file_type().is_file() {
+        return Err(WalletError::InvalidArtifact(
+            "temporary secret artifact was substituted".into(),
+        ));
+    }
+    if path_metadata.dev() != opened_metadata.dev()
+        || path_metadata.ino() != opened_metadata.ino()
+        || opened_metadata.nlink() != 1
+    {
+        return Err(WalletError::InvalidArtifact(
+            "temporary secret artifact inode changed before publication".into(),
+        ));
+    }
+    if opened_metadata.permissions().mode() & 0o7777 != 0o600 {
+        return Err(WalletError::InvalidArtifact(
+            "temporary secret artifact permissions changed before publication".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_temporary_entry(_file: &File, _path: &Path) -> Result<(), WalletError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private-artifact writes are unsupported on this platform",
+    )
+    .into())
+}
+
+struct TemporaryArtifact {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl TemporaryArtifact {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            remove_on_drop: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn mark_published(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for TemporaryArtifact {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn publish_without_overwrite(temporary_path: &Path, path: &Path) -> std::io::Result<()> {
+    fs::hard_link(temporary_path, path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private-artifact directory synchronization is unsupported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+fn open_private_file_no_follow(path: &Path) -> Result<File, WalletError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    const O_NOFOLLOW: std::ffi::c_int = 0x0002_0000;
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: std::ffi::c_int = 0x0000_0100;
+
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(O_NOFOLLOW);
+    Ok(options.open(path)?)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "android", target_os = "linux", target_os = "macos"))
+))]
+fn open_private_file_no_follow(_path: &Path) -> Result<File, WalletError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no-follow private-artifact reads are unsupported on this platform",
+    )
+    .into())
+}
+
+#[cfg(not(unix))]
+fn open_private_file_no_follow(_path: &Path) -> Result<File, WalletError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no-follow private-artifact reads are unsupported on this platform",
+    )
+    .into())
+}
+
+#[cfg(unix)]
+fn verify_opened_file(
+    path_metadata: &fs::Metadata,
+    opened_metadata: &fs::Metadata,
+) -> Result<(), WalletError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if path_metadata.dev() != opened_metadata.dev() || path_metadata.ino() != opened_metadata.ino()
+    {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact changed while it was opened".into(),
+        ));
+    }
+    if opened_metadata.nlink() != 1 {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact must not have hardlinks".into(),
+        ));
+    }
+    if opened_metadata.permissions().mode() & 0o7777 != 0o600 {
+        return Err(WalletError::InvalidArtifact(
+            "secret artifact has insecure permissions".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_opened_file(
+    _path_metadata: &fs::Metadata,
+    _opened_metadata: &fs::Metadata,
+) -> Result<(), WalletError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private-artifact verification is unsupported on this platform",
+    )
+    .into())
 }
