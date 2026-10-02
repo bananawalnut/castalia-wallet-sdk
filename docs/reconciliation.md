@@ -7,3 +7,5 @@ Signing, identity derivation, v1 encodings, dependencies and CLI signing self-te
 Security boundary: direct-parent validation assumes trusted, nonreplaceable path ancestors. Full descriptor-relative ancestor traversal and independent custody audit remain outside this change. Reads fail closed on unsupported platforms.
 
 Validation on 2026-10-02 with Rust 1.96.0: locked offline all-target tests passed (16 integration cases), locked offline Clippy passed with warnings denied, formatting passed, and the original CLI signing/unlock/recovery self-test passed. Tests cover private-mode enforcement, no overwrite, temporary cleanup, persisted identity/recovery round trips, unsafe filesystem entries and explicit post-publication error messages. Cargo manifests, lockfile and CLI are unchanged.
+
+Linux CI initially exposed a test-fixture assumption: checking a top-level temp directory exercises rejection of its world-writable `/tmp` parent before file-type rejection. The fixture now nests the non-file inside a trusted private parent, preserving both production checks. Runtime code and signing/recovery fixtures are unchanged.

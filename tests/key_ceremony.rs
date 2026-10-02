@@ -219,13 +219,16 @@ fn private_reads_reject_symlinks_before_parsing() {
 #[test]
 fn private_reads_reject_non_regular_files_before_parsing() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Keep the direct parent private on Linux too: /tmp is intentionally writable.
+    let artifact = dir.path().join("not-a-file");
+    fs::create_dir(&artifact).expect("directory artifact");
 
     assert!(matches!(
-        LocalVault::read(dir.path()),
+        LocalVault::read(&artifact),
         Err(WalletError::InvalidArtifact(message)) if message.contains("regular file")
     ));
     assert!(matches!(
-        RecoveryKit::read(dir.path()),
+        RecoveryKit::read(&artifact),
         Err(WalletError::InvalidArtifact(message)) if message.contains("regular file")
     ));
 }

@@ -8,3 +8,5 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ### Fixed
 
 - Validate and durably publish private artifacts without overwriting destinations — prevent unsafe filesystem entries, partial writes and ambiguous post-publication errors while preserving v1 custody and signing formats.
+
+- Make the non-regular-file regression fixture independent of the host temp-directory permissions, so Linux exercises the intended rejection without weakening trusted-parent validation.
