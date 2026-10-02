@@ -559,7 +559,38 @@ fn envelope_aad(kind: &str, anchor_id: &[u8; 32]) -> Vec<u8> {
     aad
 }
 
+// This private seam lets tests fail individual durability operations while the
+// production entry point always uses the real filesystem implementation.
+trait PrivateArtifactOperations {
+    fn sync_file(&mut self, file: &File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    fn publish(&mut self, temporary: &Path, destination: &Path) -> std::io::Result<()> {
+        publish_without_overwrite(temporary, destination)
+    }
+
+    fn unlink_temporary(&mut self, temporary: &Path) -> std::io::Result<()> {
+        fs::remove_file(temporary)
+    }
+
+    fn sync_parent(&mut self, parent: &Path) -> std::io::Result<()> {
+        sync_parent_directory(parent)
+    }
+}
+
+struct FilesystemArtifactOperations;
+impl PrivateArtifactOperations for FilesystemArtifactOperations {}
+
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), WalletError> {
+    write_private_json_with_operations(path, value, &mut FilesystemArtifactOperations)
+}
+
+fn write_private_json_with_operations<T: Serialize>(
+    path: &Path,
+    value: &T,
+    operations: &mut impl PrivateArtifactOperations,
+) -> Result<(), WalletError> {
     let parent = artifact_parent(path);
     verify_trusted_parent(parent)?;
 
@@ -567,13 +598,13 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Wallet
     let (mut file, mut temporary) = create_private_temporary(parent)?;
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
+    operations.sync_file(&file)?;
     verify_temporary_entry(&file, temporary.path())?;
 
-    publish_without_overwrite(temporary.path(), path)?;
+    operations.publish(temporary.path(), path)?;
     temporary.mark_published();
-    let unlink_error = fs::remove_file(temporary.path()).err();
-    let parent_sync_error = sync_parent_directory(parent).err();
+    let unlink_error = operations.unlink_temporary(temporary.path()).err();
+    let parent_sync_error = operations.sync_parent(parent).err();
     match (unlink_error, parent_sync_error) {
         (None, None) => Ok(()),
         (None, Some(error)) => Err(WalletError::DestinationCommittedParentSync(error)),
@@ -868,3 +899,9 @@ fn verify_opened_file(
     )
     .into())
 }
+
+#[cfg(all(
+    test,
+    any(target_os = "android", target_os = "linux", target_os = "macos")
+))]
+mod private_file_tests;
